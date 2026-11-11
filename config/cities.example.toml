@@ -1,0 +1,54 @@
+# Example Multi-Machine & Multi-City Configuration for gc-mcp
+default_machine = "node-primary"
+default_city = "gascity"
+
+[[machines]]
+id = "node-primary"
+transport = "local"
+supervisor_url = "http://127.0.0.1:8372"
+gc_bin = "gc"
+default_city = "gascity"
+default_cwd = "/home/user/gascity"
+
+[[machines]]
+id = "node-worker-1"
+transport = "ssh"
+ssh_target = "user@worker-1.tailnet.ts.net"
+supervisor_url = "http://worker-1.tailnet.ts.net:8372"
+gc_bin = "/usr/local/bin/gc"
+default_city = "worker-city"
+default_cwd = "/home/user/worker-city"
+
+[[cities]]
+name = "gascity"
+machine = "node-primary"
+city_dir = "/home/user/gascity"
+supervisor_url = "http://127.0.0.1:8372"
+description = "Primary Gas City workspace"
+
+[[cities]]
+name = "factory-world"
+machine = "node-primary"
+city_dir = "/home/user/factory-world"
+supervisor_url = "http://127.0.0.1:8372"
+description = "Secondary city on primary node"
+
+[[cities]]
+name = "worker-city"
+machine = "node-worker-1"
+city_dir = "/home/user/worker-city"
+supervisor_url = "http://worker-1.tailnet.ts.net:8372"
+description = "Remote city on worker-1"
+
+[[clis]]
+name = "gc"
+binary = "gc"
+default_machine = "node-primary"
+description = "Gas City CLI"
+
+[[clis]]
+name = "bd"
+binary = "bd"
+allowed_subcommands = ["list", "ready", "show", "status", "version"]
+default_machine = "node-primary"
+description = "Beads issue tracker CLI"
