@@ -196,11 +196,63 @@ def test_http_server_oauth_and_multi_machine_endpoints() -> None:
         st_exec, exec_res = _http_json(
             "POST",
             f"{base}/api/v1/multi-exec",
-            {"cli": "gc", "subcommand": "version", "machines": ["bhd-main2"]},
+            {"cli": "gc", "subcommand": "version", "machines": "bhd-main2"},
             headers=headers,
         )
         assert st_exec == 200
         assert exec_res["ok"] is True
+        assert exec_res["machines"] == ["bhd-main2"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_google_oauth_redirect_and_external_host_enforcement() -> None:
+    oauth = OAuthManager(
+        base_url="http://127.0.0.1:8375",
+        auth_mode="optional",
+        allowed_emails=["buihongduc132@gmail.com"],
+        google_client_id="759401699226-test.apps.googleusercontent.com",
+        google_client_secret="test-oauth-client-secret-placeholder",
+    )
+    backend = GCBackend(city_dir="/tmp", gc_bin="/bin/echo", oauth=oauth)
+    srv = create_server(host="127.0.0.1", port=0, backend=backend)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        # 1. External host header enforces 401 even when auth_mode is optional locally
+        st_ext, _ = _http_json(
+            "POST",
+            f"{base}/mcp",
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={"X-Forwarded-Host": "gc-mcp.34.126.131.83.sslip.io", "X-Forwarded-Proto": "https"},
+        )
+        assert st_ext == 401
+
+        # 2. Metadata reflects X-Forwarded-Host and X-Forwarded-Proto
+        st_meta, meta = _http_json(
+            "GET",
+            f"{base}/.well-known/oauth-authorization-server",
+            headers={"X-Forwarded-Host": "gc-mcp.34.126.131.83.sslip.io", "X-Forwarded-Proto": "https"},
+        )
+        assert st_meta == 200
+        assert meta["issuer"] == "https://gc-mcp.34.126.131.83.sslip.io"
+        assert meta["authorization_endpoint"] == "https://gc-mcp.34.126.131.83.sslip.io/oauth/authorize"
+
+        # 3. Google OAuth redirect URL construction
+        redir_url = oauth.start_google_authorization(
+            client_id="chatgpt-client",
+            redirect_uri="https://chatgpt.com/connector_platform_oauth_redirect",
+            state="chatgpt-state-123",
+            code_challenge="challenge-abc",
+            code_challenge_method="S256",
+            req_base_url="https://gc-mcp.34.126.131.83.sslip.io",
+        )
+        assert redir_url.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+        assert "759401699226-test.apps.googleusercontent.com" in redir_url
+        assert "gc-mcp.34.126.131.83.sslip.io%2Foauth%2Fgoogle%2Fcallback" in redir_url
     finally:
         srv.shutdown()
         srv.server_close()

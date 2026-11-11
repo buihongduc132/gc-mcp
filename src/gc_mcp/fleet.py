@@ -265,7 +265,7 @@ class FleetRouter:
                 "error": f"Subcommand {subcommand!r} not in allowed list for {cli_name}: {spec.allowed_subcommands}",
             }
         target_machine = machine or spec.default_machine
-        argv = [spec.binary, subcommand, *[str(a) for a in (args or [])]]
+        argv = [spec.binary, *([subcommand] if subcommand else []), *[str(a) for a in (args or [])]]
         res = self.exec_on_machine(argv=argv, machine=target_machine, cwd=cwd, timeout=timeout)
         res["cli"] = cli_name
         res["subcommand"] = subcommand

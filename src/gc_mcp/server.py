@@ -613,18 +613,17 @@ MCP_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "gc_multi_exec",
-        "description": "Execute any wrapped CLI (`gc`, `gt`, `bd`, `herdr`, etc.) on one or multiple machines in parallel.",
+        "description": "Execute any wrapped CLI (`gc`, `gt`, `bd`, `herdr`, `hostname`) on one or multiple machines in parallel (`bhd-main2`, `bhd-pad1`, `gcp-23dec`, `cfly-out`).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cli": {"type": "string", "description": "Wrapped CLI name (default: gc)"},
-                "subcommand": {"type": "string", "description": "CLI subcommand to run"},
+                "cli": {"type": "string", "description": "Wrapped CLI name (default: gc; options: gc, gt, bd, herdr, hostname)"},
+                "subcommand": {"type": "string", "description": "CLI subcommand to run (optional for single-binary CLIs like hostname)"},
                 "args": {"type": "array", "items": {"type": "string"}},
                 "machine": {"type": "string", "description": "Single target machine ID"},
                 "machines": {"type": "array", "items": {"type": "string"}, "description": "Multiple machine IDs for parallel fan-out"},
                 "timeout": {"type": "number"},
             },
-            "required": ["subcommand"],
         },
     },
 ]
@@ -644,15 +643,19 @@ def execute_mcp_tool(backend: GCBackend, name: str, arguments: dict[str, Any] | 
 
     if name == "gc_multi_exec":
         cli_name = str(args.get("cli") or "gc")
-        subcmd = str(args.get("subcommand") or "version")
-        sub_args = [str(x) for x in (args.get("args") or [])]
-        t_sec = float(args.get("timeout") or 20.0)
-        if args.get("machines"):
+        raw_sub = args.get("subcommand")
+        subcmd = str(raw_sub) if raw_sub is not None else ("version" if cli_name == "gc" else "")
+        raw_sub_args = args.get("args") or []
+        sub_args = [x.strip() for x in raw_sub_args.split(",") if x.strip()] if isinstance(raw_sub_args, str) else [str(x) for x in raw_sub_args]
+        t_sec = float(args.get("timeout") or args.get("timeout_sec") or 20.0)
+        raw_machines = args.get("machines")
+        if raw_machines:
+            m_list = [m.strip() for m in raw_machines.split(",") if m.strip()] if isinstance(raw_machines, str) else [str(m) for m in raw_machines]
             return backend.fleet.fanout_cli(
                 cli_name=cli_name,
                 subcommand=subcmd,
                 args=sub_args,
-                machines=[str(m) for m in args["machines"]],
+                machines=m_list,
                 timeout=t_sec,
             )
         return backend.fleet.run_wrapped_cli(
@@ -1004,11 +1007,60 @@ def make_handler(backend: GCBackend):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "*")
+            self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id, WWW-Authenticate")
 
-        def _send_json(self, status: int, payload: Any) -> None:
+        def _request_base_url(self) -> str:
+            fwd_host = (self.headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
+            host = fwd_host or (self.headers.get("Host") or "").strip()
+            fwd_proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip()
+            if not host or host in ("127.0.0.1:8375", "localhost:8375"):
+                return backend.oauth.base_url
+            is_https_host = (
+                host.endswith(".ts.net")
+                or ":18375" in host
+                or ":10000" in host
+                or ".sslip.io" in host
+                or ".nip.io" in host
+                or ".run.app" in host
+            )
+            proto = "https" if is_https_host else (fwd_proto or "http")
+            return f"{proto}://{host}".rstrip("/")
+
+        def _is_external_request(self) -> bool:
+            if (self.headers.get("X-Require-OAuth") or "").lower() in ("1", "true", "yes"):
+                return True
+            burl = self._request_base_url().lower()
+            return any(tok in burl for tok in (".sslip.io", ".nip.io", ":10000", ".run.app"))
+
+        def _send_unauthorized(self) -> None:
+            req_base = self._request_base_url()
+            self.send_response(401)
+            self._send_cors()
+            self.send_header(
+                "WWW-Authenticate",
+                f'Bearer resource_metadata="{req_base}/.well-known/oauth-protected-resource"',
+            )
+            self.send_header("Content-Type", "application/json")
+            err = json.dumps({"error": "unauthorized", "error_description": "Bearer token required"}).encode("utf-8")
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            self.wfile.write(err)
+
+        def _send_redirect(self, location: str, status: int = 302) -> None:
+            self.send_response(status)
+            self._send_cors()
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _send_json(self, status: int, payload: Any, extra_headers: dict[str, str] | None = None) -> None:
             raw = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self._send_cors()
+            if extra_headers:
+                for hk, hv in extra_headers.items():
+                    self.send_header(hk, hv)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
@@ -1028,13 +1080,50 @@ def make_handler(backend: GCBackend):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             query = urllib.parse.parse_qs(parsed.query)
+            req_base = self._request_base_url()
 
-            if path == "/.well-known/oauth-authorization-server":
-                self._send_json(200, backend.oauth.metadata())
+            if path.startswith("/.well-known/oauth-authorization-server") or path.startswith(
+                "/.well-known/openid-configuration"
+            ):
+                self._send_json(200, backend.oauth.metadata(req_base))
                 return
 
-            if path == "/.well-known/oauth-protected-resource":
-                self._send_json(200, backend.oauth.protected_resource_metadata())
+            if path.startswith("/.well-known/oauth-protected-resource"):
+                self._send_json(200, backend.oauth.protected_resource_metadata(req_base))
+                return
+
+            if path == "/oauth/userinfo":
+                ok, claims = backend.oauth.check_request_auth(
+                    self.headers.get("Authorization"), require_auth=True
+                )
+                if not ok or not claims:
+                    self._send_unauthorized()
+                    return
+                self._send_json(
+                    200,
+                    {
+                        "sub": claims.get("sub", "google:buihongduc132@gmail.com"),
+                        "email": claims.get("email", "buihongduc132@gmail.com"),
+                        "email_verified": True,
+                        "name": "Duc Bui",
+                    },
+                )
+                return
+
+            if path == "/oauth/google/callback":
+                google_code = (query.get("code") or [""])[0]
+                gstate = (query.get("state") or [""])[0]
+                if not google_code or not gstate:
+                    self._send_json(
+                        400,
+                        {"error": "invalid_request", "error_description": "Missing code or state from Google"},
+                    )
+                    return
+                st, res = backend.oauth.complete_google_callback(google_code=google_code, gstate=gstate)
+                if st == 302 and isinstance(res, str):
+                    self._send_redirect(res, 302)
+                    return
+                self._send_json(st, res)
                 return
 
             if path == "/oauth/authorize":
@@ -1043,7 +1132,35 @@ def make_handler(backend: GCBackend):
                 code_challenge = (query.get("code_challenge") or [""])[0]
                 code_challenge_method = (query.get("code_challenge_method") or ["S256"])[0]
                 state = (query.get("state") or [""])[0]
+                scope = (query.get("scope") or ["openid email mcp:tools"])[0]
                 email = (query.get("email") or ["buihongduc132@gmail.com"])[0]
+                accept = (self.headers.get("Accept") or "").lower()
+                fmt = (query.get("format") or [""])[0].lower()
+                flow = (query.get("flow") or [""])[0].lower()
+
+                use_google_redirect = (
+                    fmt != "json"
+                    and bool(backend.oauth.google_client_id)
+                    and (
+                        flow == "google"
+                        or "text/html" in accept
+                        or "chatgpt.com" in redirect_uri
+                        or "openai.com" in redirect_uri
+                    )
+                )
+                if use_google_redirect:
+                    google_url = backend.oauth.start_google_authorization(
+                        client_id=client_id,
+                        redirect_uri=redirect_uri,
+                        code_challenge=code_challenge,
+                        code_challenge_method=code_challenge_method,
+                        state=state,
+                        scope=scope,
+                        req_base_url=req_base,
+                    )
+                    self._send_redirect(google_url, 302)
+                    return
+
                 code = backend.oauth.create_authorization_code(
                     client_id=client_id,
                     redirect_uri=redirect_uri,
@@ -1051,11 +1168,15 @@ def make_handler(backend: GCBackend):
                     code_challenge_method=code_challenge_method,
                     state=state,
                     email=email,
+                    scope=scope,
                 )
                 sep = "&" if "?" in redirect_uri else "?"
                 location = f"{redirect_uri}{sep}code={urllib.parse.quote(code)}"
                 if state:
                     location += f"&state={urllib.parse.quote(state)}"
+                if fmt != "json" and ("text/html" in accept or "chatgpt.com" in redirect_uri):
+                    self._send_redirect(location, 302)
+                    return
                 self._send_json(
                     200,
                     {
@@ -1109,6 +1230,7 @@ def make_handler(backend: GCBackend):
                         "wrapped_clis": sorted(backend.fleet.clis.keys()),
                         "oauth_enabled": True,
                         "oauth_mode": backend.oauth.auth_mode,
+                        "google_oauth_configured": bool(backend.oauth.google_client_id),
                     },
                 )
                 return
@@ -1209,11 +1331,16 @@ def make_handler(backend: GCBackend):
                 return
 
             if path in ("/mcp", "/sse"):
+                auth_ok, _ = backend.oauth.check_request_auth(
+                    self.headers.get("Authorization"), require_auth=self._is_external_request()
+                )
+                if not auth_ok:
+                    self._send_unauthorized()
+                    return
                 accept = self.headers.get("Accept", "")
                 if path == "/sse" or "text/event-stream" in accept:
                     body = (
-                        "event: endpoint\n"
-                        "data: /mcp\n\n"
+                        ("event: endpoint\ndata: /mcp\n\n" if path == "/sse" else ": ping\n\n")
                     ).encode("utf-8")
                     self.send_response(200)
                     self._send_cors()
@@ -1228,7 +1355,7 @@ def make_handler(backend: GCBackend):
                     {
                         "name": "gc-mcp-rest",
                         "version": "1.0.0",
-                        "protocolVersion": "2024-11-05",
+                        "protocolVersion": "2025-03-26",
                         "transport": ["streamable-http", "sse"],
                         "tools_count": len(MCP_TOOLS),
                         "resources_count": len(MCP_RESOURCES),
@@ -1245,6 +1372,7 @@ def make_handler(backend: GCBackend):
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
+            req_base = self._request_base_url()
 
             if path in ("/oauth/register", "/oauth/token", "/device/code", "/device/approve", "/device/poll"):
                 raw = self._read_body()
@@ -1256,11 +1384,11 @@ def make_handler(backend: GCBackend):
                     self._send_json(201, backend.oauth.register_client(body))
                     return
                 if path == "/oauth/token":
-                    st, tok_payload = backend.oauth.exchange_code(body)
+                    st, tok_payload = backend.oauth.exchange_code(body, req_base_url=req_base)
                     self._send_json(st, tok_payload)
                     return
                 if path == "/device/code":
-                    self._send_json(200, backend.oauth.start_device_flow(body))
+                    self._send_json(200, backend.oauth.start_device_flow(body, req_base_url=req_base))
                     return
                 if path == "/device/approve":
                     st, app_payload = backend.oauth.approve_device_flow(
@@ -1270,23 +1398,16 @@ def make_handler(backend: GCBackend):
                     self._send_json(st, app_payload)
                     return
                 if path == "/device/poll":
-                    st, poll_payload = backend.oauth.poll_device_flow(body)
+                    st, poll_payload = backend.oauth.poll_device_flow(body, req_base_url=req_base)
                     self._send_json(st, poll_payload)
                     return
 
-            auth_ok, _ = backend.oauth.check_request_auth(self.headers.get("Authorization"))
+            auth_ok, _ = backend.oauth.check_request_auth(
+                self.headers.get("Authorization"), require_auth=self._is_external_request()
+            )
             if not auth_ok:
-                self.send_response(401)
-                self._send_cors()
-                self.send_header(
-                    "WWW-Authenticate",
-                    f'Bearer resource_metadata="{backend.oauth.base_url}/.well-known/oauth-protected-resource"',
-                )
-                self.send_header("Content-Type", "application/json")
-                err = json.dumps({"error": "unauthorized", "error_description": "Bearer token required"}).encode("utf-8")
-                self.send_header("Content-Length", str(len(err)))
-                self.end_headers()
-                self.wfile.write(err)
+                self._read_body()
+                self._send_unauthorized()
                 return
 
             if path in ("/mcp", "/messages"):
@@ -1356,18 +1477,24 @@ def make_handler(backend: GCBackend):
             if self.path.startswith("/v0/"):
                 self._proxy_supervisor("PUT")
             else:
+                self._read_body()
                 self._send_json(404, {"ok": False, "error": f"Not found: {self.path}"})
 
         def do_PATCH(self) -> None:
             if self.path.startswith("/v0/"):
                 self._proxy_supervisor("PATCH")
             else:
+                self._read_body()
                 self._send_json(404, {"ok": False, "error": f"Not found: {self.path}"})
 
         def do_DELETE(self) -> None:
-            if self.path.startswith("/v0/"):
+            if self.path.startswith("/mcp") or self.path.startswith("/sse"):
+                self._read_body()
+                self._send_json(200, {"ok": True})
+            elif self.path.startswith("/v0/"):
                 self._proxy_supervisor("DELETE")
             else:
+                self._read_body()
                 self._send_json(404, {"ok": False, "error": f"Not found: {self.path}"})
 
         def _proxy_supervisor(self, method: str) -> None:
@@ -1396,20 +1523,24 @@ def make_handler(backend: GCBackend):
                 )
                 return
 
+            session_id = self.headers.get("Mcp-Session-Id") or "gcmcp-session-1"
+            extra_hdrs = {"Mcp-Session-Id": session_id}
+
             if isinstance(msg, list):
                 responses = [self._dispatch_jsonrpc(item) for item in msg]
                 filtered = [r for r in responses if r is not None]
-                self._send_json(200, filtered)
+                self._send_json(200, filtered, extra_headers=extra_hdrs)
                 return
 
             resp = self._dispatch_jsonrpc(msg)
             if resp is None:
                 self.send_response(202)
                 self._send_cors()
+                self.send_header("Mcp-Session-Id", session_id)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            self._send_json(200, resp)
+            self._send_json(200, resp, extra_headers=extra_hdrs)
 
         def _dispatch_jsonrpc(self, req: dict[str, Any]) -> dict[str, Any] | None:
             req_id = req.get("id")
